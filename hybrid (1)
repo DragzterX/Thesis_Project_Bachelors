@@ -1,0 +1,548 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import torch
+import nibabel as nib
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from torch import nn, optim
+from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, accuracy_score
+from sklearn.model_selection import StratifiedKFold
+import skimage.transform
+from torch.cuda.amp import GradScaler
+import torchio as tio
+import torch.optim.lr_scheduler as lr_scheduler
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
+#------------------------------------------------------------------------------#
+#                                   DEVICE                                     #
+#------------------------------------------------------------------------------#
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+#------------------------------------------------------------------------------#
+#                                 CUSTOM LOSS                                  #
+#------------------------------------------------------------------------------#
+class WeightedCrossEntropyLoss(nn.Module):
+    def __init__(self, weight=None):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, inputs, targets):
+        return nn.functional.cross_entropy(inputs, targets, weight=self.weight)
+
+#------------------------------------------------------------------------------#
+#                                EARLY STOPPING                                #
+#------------------------------------------------------------------------------#
+class EarlyStopping:
+    def __init__(self, patience=25, delta=0.005, metric='auc', mode='max'):
+        self.patience = patience
+        self.delta = delta
+        self.metric = metric
+        self.mode = mode
+        self.best_score = None
+        self.wait = 0
+        self.stop = False
+
+    def __call__(self, current_score):
+        if self.best_score is None:
+            self.best_score = current_score
+            return False
+        elif (self.mode == 'max' and current_score > self.best_score + self.delta) or \
+             (self.mode == 'min' and current_score < self.best_score - self.delta):
+            self.best_score = current_score
+            self.wait = 0
+            return False
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                self.stop = True
+                return True
+            return False
+
+#------------------------------------------------------------------------------#
+#                                   DATASET                                    #
+#------------------------------------------------------------------------------#
+class EnhancedFMRIDataset3D(Dataset):
+    def __init__(self, fmri_paths, labels, transform=None):
+        self.fmri_paths, self.labels = [], []
+        for path, label in zip(fmri_paths, labels):
+            if os.path.exists(path):
+                try:
+                    nib.load(path).header
+                    self.fmri_paths.append(path)
+                    self.labels.append(label)
+                except Exception as e:
+                    print(f"Skipping file {path}: {str(e)}")
+        self.transform = transform
+        print(f"Valid samples loaded: {len(self.fmri_paths)}")
+
+    def __getitem__(self, idx):
+        try:
+            img_nifti = nib.load(self.fmri_paths[idx])
+            data = img_nifti.get_fdata()
+            if data.ndim == 4:
+                data_3d = np.std(data, axis=3)
+            elif data.ndim == 3:
+                data_3d = data
+            else:
+                return self._create_dummy_data(self.labels[idx])
+            p99 = np.percentile(data_3d, 99.9)
+            p1 = np.percentile(data_3d, 0.1)
+            data_3d = (data_3d - p1) / (p99 - p1 + 1e-8)
+            data_3d = np.clip(data_3d, 0, 1)
+            data_3d = skimage.transform.resize(data_3d, (64, 64, 64), anti_aliasing=True)
+            data_3d = torch.from_numpy(data_3d).float().unsqueeze(0)
+            if self.transform:
+                data_3d = self.transform(data_3d)
+            return data_3d, torch.tensor(self.labels[idx], dtype=torch.long)
+        except Exception as e:
+            print(f"Error loading {self.fmri_paths[idx]}: {str(e)}")
+            return self._create_dummy_data(self.labels[idx])
+
+    def _create_dummy_data(self, label):
+        return torch.zeros((1, 64, 64, 64), dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.fmri_paths)
+
+transform = tio.Compose([
+    tio.RandomFlip(axes=('LR', 'AP', 'SI'), p=0.8),
+    tio.RandomAffine(scales=(0.6, 1.4), degrees=40, p=0.8),
+    tio.RandomElasticDeformation(num_control_points=15, max_displacement=20, p=0.7),
+    tio.RandomNoise(mean=0, std=(0, 0.3), p=0.7),
+    tio.RandomBiasField(coefficients=0.5, p=0.7),
+    tio.RandomGamma(log_gamma=(-0.8, 0.8), p=0.7),
+    tio.RandomAnisotropy(p=0.6),
+])
+
+#------------------------------------------------------------------------------#
+#                               MODEL DEFINITION                               #
+#------------------------------------------------------------------------------#
+class CoordConv3D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels + 3, out_channels, kernel_size, stride, padding)
+
+    def forward(self, x):
+        batch_size, _, h, w, d = x.shape
+        x_c = torch.linspace(-1, 1, h).view(1, 1, h, 1, 1).expand(batch_size, 1, h, w, d).to(x.device)
+        y_c = torch.linspace(-1, 1, w).view(1, 1, 1, w, 1).expand(batch_size, 1, h, w, d).to(x.device)
+        z_c = torch.linspace(-1, 1, d).view(1, 1, 1, 1, d).expand(batch_size, 1, h, w, d).to(x.device)
+        x = torch.cat([x, x_c, y_c, z_c], dim=1)
+        return self.conv(x)
+
+class LocalitySelfAttention(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.3):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.temperatures = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        mask = torch.eye(N, device=attn.device).bool().unsqueeze(0).unsqueeze(0)
+        attn = attn.masked_fill(mask, float('-inf'))
+        attn = torch.softmax(attn / self.temperatures, dim=-1)
+        attn = self.dropout(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj(x)
+
+class ViT3DFeaturesEnhanced(nn.Module):
+    def __init__(self, input_shape=(1, 64, 64, 64), patch_size=16, embed_dim=192, num_heads=6, num_layers=4, dropout=0.3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.num_patches = (input_shape[1] // patch_size) ** 3
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = self._create_coord_pos_embed(input_shape, patch_size, embed_dim)
+        self.pos_drop = nn.Dropout(p=dropout)
+        self.patch_embed = CoordConv3D(5, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.transformer = nn.ModuleList([
+            nn.ModuleList([
+                LocalitySelfAttention(embed_dim, num_heads, dropout),
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Linear(embed_dim * 4, embed_dim),
+                nn.LayerNorm(embed_dim)
+            ]) for _ in range(num_layers)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def _create_coord_pos_embed(self, input_shape, patch_size, embed_dim):
+        h, w, d = input_shape[1] // patch_size, input_shape[2] // patch_size, input_shape[3] // patch_size
+        x_c = torch.linspace(-1, 1, h).view(h, 1, 1).expand(h, w, d)
+        y_c = torch.linspace(-1, 1, w).view(1, w, 1).expand(h, w, d)
+        z_c = torch.linspace(-1, 1, d).view(1, 1, d).expand(h, w, d)
+        coords = torch.stack([x_c, y_c, z_c], dim=-1).flatten(0, 2)
+        pos_embed = nn.Linear(3, embed_dim)(coords).unsqueeze(0)
+        cls_pos = torch.zeros(1, 1, embed_dim)
+        return nn.Parameter(torch.cat([cls_pos, pos_embed], dim=1))
+
+    def shift_patches(self, x):
+        shift = self.patch_size // 2
+        shifts = [
+            (shift, shift, shift),
+            (shift, -shift, shift),
+            (-shift, shift, shift),
+            (-shift, -shift, shift)
+        ]
+        shifted = [x]
+        for dx, dy, dz in shifts:
+            shifted_x = torch.roll(x, shifts=(dx, dy, dz), dims=(2, 3, 4))
+            shifted.append(shifted_x[:, :, :64, :64, :64])
+        return torch.cat(shifted, dim=1)
+
+    def forward_features(self, x):
+        x = self.shift_patches(x)
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+    def forward(self, x, convnext_features):
+        x = self.forward_features(x)
+        cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        projected_convnext = nn.Linear(convnext_features.shape[1], self.embed_dim).to(convnext_features.device)(convnext_features).unsqueeze(1)
+        expanded_convnext = projected_convnext.expand(-1, self.num_patches, -1)
+        x = torch.cat((x[:, :1, :], x[:, 1:, :] + expanded_convnext), dim=1)
+        for attn, norm1, ffn1, act, ffn2, norm2 in self.transformer:
+            x = x + norm1(attn(x))
+            x = x + norm2(ffn2(act(ffn1(x))))
+        return self.norm(x[:, 0])
+
+class ConvNeXtBlockBase(nn.Module):
+    def __init__(self, dim, conv_layer, drop_path=0., layer_scale_init_value=1e-6, dropout=0.2):
+        super().__init__()
+        self.dwconv = conv_layer(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=dim)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim,)), requires_grad=True) if layer_scale_init_value > 0 else None
+        self.drop_path = nn.Dropout(dropout) if drop_path > 0 else nn.Identity()
+
+    def forward(self, x):
+        shortcut = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = x.permute(0, *range(2, x.ndim), 1)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, -1, *range(1, x.ndim - 1))
+        x = shortcut + self.drop_path(x)
+        return x
+
+class ConvNeXtBaseFeatures(nn.Module):
+    def __init__(self, in_chans, depths, dims, conv_layer, pool_layer, dropout=0.2):
+        super().__init__()
+        self.downsample_layers = nn.ModuleList()
+        stem = nn.Sequential(
+            conv_layer(in_chans, dims[0], kernel_size=4, stride=4),
+            nn.GroupNorm(num_groups=1, num_channels=dims[0])
+        )
+        self.downsample_layers.append(stem)
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                nn.GroupNorm(num_groups=1, num_channels=dims[i]),
+                conv_layer(dims[i], dims[i + 1], kernel_size=2, stride=2),
+            )
+            self.downsample_layers.append(downsample_layer)
+        self.stages = nn.ModuleList()
+        for i in range(4):
+            stage = nn.Sequential(
+                *[ConvNeXtBlockBase(dim=dims[i], conv_layer=conv_layer, dropout=dropout) for _ in range(depths[i])]
+            )
+            self.stages.append(stage)
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=dims[-1])
+        self.pool_layer = pool_layer
+
+    def forward_features(self, x):
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+        return self.norm(x.mean(dim=self.pool_layer))
+
+    def forward(self, x):
+        return self.forward_features(x)
+
+class ConvNeXt3DFeaturesV2(ConvNeXtBaseFeatures):
+    def __init__(self, in_chans=1, depths=[2, 2, 6, 2], dims=[64, 128, 256, 512], dropout=0.2):
+        super().__init__(in_chans, depths, dims, conv_layer=nn.Conv3d, pool_layer=[-1, -2, -3], dropout=dropout)
+
+class HybridModelEnhanced(nn.Module):
+    def __init__(self, vit_embed_dim=192, convnext_embed_dim=512, num_classes=2, dropout=0.4):
+        super().__init__()
+        self.convnext_model = ConvNeXt3DFeaturesV2()
+        self.vit_model = ViT3DFeaturesEnhanced()
+        self.fc = nn.Sequential(
+            nn.Linear(vit_embed_dim, 256),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        convnext_features = self.convnext_model(x).flatten(1)
+        vit_features = self.vit_model(x, convnext_features)
+        return self.fc(vit_features)
+
+#------------------------------------------------------------------------------#
+#                              TRAINING FUNCTION                               #
+#------------------------------------------------------------------------------#
+def train_model(model, train_loader, val_loader, fold, epochs=100, class_weights=None, save_model_path=None):
+    model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    criterion = WeightedCrossEntropyLoss(weight=class_weights)
+    early_stopping = EarlyStopping(patience=50, delta=0.005, metric='auc', mode='max')
+    scaler = GradScaler()
+
+    epoch_acc_list, epoch_f1_list, epoch_auc_list = [], [], []
+    epoch_train_loss_list, epoch_val_loss_list = [], []
+    best_auc = 0
+    best_state = None
+
+    # To store probabilities & labels for best epoch
+    best_epoch_probs = []
+    best_epoch_labels = []
+
+    for epoch in range(epochs):
+        model.train()
+        running_train_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            running_train_loss += loss.item()
+
+        avg_train_loss = running_train_loss / len(train_loader)
+        epoch_train_loss_list.append(avg_train_loss)
+
+        model.eval()
+        running_val_loss = 0.0
+        all_preds, all_labels, all_probs = [], [], []
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                with torch.amp.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                running_val_loss += loss.item()
+                probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                all_probs.extend(probs)
+                all_labels.extend(labels.cpu().numpy())
+
+        avg_val_loss = running_val_loss / len(val_loader)
+        epoch_val_loss_list.append(avg_val_loss)
+
+        # Compute AUC using all_probs & all_labels
+        auc = roc_auc_score(all_labels, all_probs) if len(np.unique(all_labels)) > 1 else 0.0
+
+        # For logging accuracy/F1 at 0.5 (not used for early stopping)
+        preds_at_half = (np.array(all_probs) >= 0.5).astype(int)
+        acc_half = accuracy_score(all_labels, preds_at_half)
+        f1_half = f1_score(all_labels, preds_at_half, zero_division=1)
+
+        epoch_acc_list.append(acc_half)
+        epoch_f1_list.append(f1_half)
+        epoch_auc_list.append(auc)
+
+        print(f"Epoch [{epoch + 1}/{epochs}] "
+              f"Train Loss: {avg_train_loss:.4f} "
+              f"Val Loss: {avg_val_loss:.4f} "
+              f"AUC-ROC: {auc:.4f} "
+              f"Acc@0.5: {acc_half * 100:.2f}% "
+              f"F1@0.5: {f1_half:.4f}")
+
+        scheduler.step()
+        if auc > best_auc:
+            best_auc = auc
+            best_state = model.state_dict()
+            best_epoch_probs = all_probs.copy()
+            best_epoch_labels = all_labels.copy()
+
+        if early_stopping(auc):
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+    if save_model_path and best_state:
+        torch.save(best_state, save_model_path)
+
+    return (
+        epoch_acc_list,
+        epoch_f1_list,
+        epoch_auc_list,
+        epoch_train_loss_list,
+        epoch_val_loss_list,
+        best_epoch_probs,
+        best_epoch_labels
+    )
+
+#------------------------------------------------------------------------------#
+#                             THRESHOLD SELECTION                              #
+#------------------------------------------------------------------------------#
+def find_best_threshold(probs, labels, thresholds=None):
+    if thresholds is None:
+        thresholds = np.linspace(0.3, 0.6, 31)  # from 0.30 to 0.60 in steps of 0.01
+    best_thresh = 0.5
+    best_f1 = 0.0
+    best_acc = 0.0
+    for t in thresholds:
+        preds = (np.array(probs) >= t).astype(int)
+        f1 = f1_score(labels, preds, zero_division=1)
+        acc = accuracy_score(labels, preds)
+        # you can choose to optimize F1 or accuracy; here we pick highest F1, tiebreak by accuracy
+        if (f1 > best_f1) or (f1 == best_f1 and acc > best_acc):
+            best_f1 = f1
+            best_acc = acc
+            best_thresh = t
+    return best_thresh, best_f1, best_acc
+
+#------------------------------------------------------------------------------#
+#                             FINE-TUNE ON COBRE                               #
+#------------------------------------------------------------------------------#
+def train_on_cobre():
+    csv_path = "E:/T2420320/dataset/cobre_model_group.csv"
+    df = pd.read_csv(csv_path).apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+    fmri_paths = [
+        os.path.join("E:/T2420320/dataset", f"fmri_{subj_id}_session1_run1.nii")
+        for subj_id in df.iloc[:, 0]
+    ]
+    labels = df.iloc[:, 1].astype(int).values
+    dataset = EnhancedFMRIDataset3D(fmri_paths, labels, transform=transform)
+
+    if len(dataset) == 0:
+        raise ValueError("Dataset is empty after loading. Check file paths and data format.")
+
+    class_counts = np.bincount(labels)
+    class_weights = 1.0 / (class_counts + 1e-8)
+    class_weights = torch.tensor(class_weights / class_weights.sum(), dtype=torch.float).to(device)
+
+    k_folds = 5
+    skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+    num_epochs = 100
+    batch_size = 8
+
+    fold_metrics = {"accuracy": [], "f1_score": [], "auc_roc": []}
+    fold_train_losses = []
+    fold_val_losses = []
+    fold_thresholds = []
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(dataset.fmri_paths, dataset.labels)):
+        print(f"\n========== Fold {fold+1} ==========")
+        train_dataset = torch.utils.data.Subset(dataset, train_idx)
+        val_dataset = torch.utils.data.Subset(dataset, val_idx)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True
+        )
+
+        model = HybridModelEnhanced()
+        # Load pretrained UCLA weights (from identical architecture)
+        model.load_state_dict(torch.load("pretrained_ucla_model.pt", map_location=device))
+
+        (
+            acc_list,
+            f1_list,
+            auc_list,
+            train_loss_list,
+            val_loss_list,
+            best_probs,
+            best_labels
+        ) = train_model(
+            model, train_loader, val_loader, fold, epochs=num_epochs, class_weights=class_weights
+        )
+
+        # Find best threshold on the held-out validation set of this fold
+        best_thresh, best_f1, best_acc = find_best_threshold(best_probs, best_labels)
+
+        # Store metrics
+        fold_thresholds.append(best_thresh)
+        fold_metrics["accuracy"].append(best_acc)
+        fold_metrics["f1_score"].append(best_f1)
+        fold_metrics["auc_roc"].append(max(auc_list) if auc_list else 0.0)
+        fold_train_losses.append(train_loss_list)
+        fold_val_losses.append(val_loss_list)
+
+        print(f"Fold {fold + 1} | Best Threshold: {best_thresh:.2f} | "
+              f"Acc@Thresh: {best_acc:.4f} | F1@Thresh: {best_f1:.4f} | AUC: {max(auc_list):.4f}")
+
+        # --------------------- Confusion Matrix (per fold) --------------------- #
+        preds_at_best = (np.array(best_probs) >= best_thresh).astype(int)
+        cm = confusion_matrix(best_labels, preds_at_best)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Control", "SCZ"])
+        disp.plot(cmap="Blues")
+        plt.title(f"Confusion Matrix - Fold {fold+1} (@Thresh={best_thresh:.2f})")
+        plt.savefig(f"confusion_matrix_fold_{fold+1}.png")
+        plt.close()
+        print(f"Confusion Matrix for Fold {fold+1}:\n{cm}\n")
+
+    # Plot metrics across folds
+    plt.figure(figsize=(10, 6))
+    folds = np.arange(1, k_folds + 1)
+    plt.plot(folds, np.array(fold_metrics["accuracy"]) * 100, label="Accuracy", marker="o")
+    plt.plot(folds, np.array(fold_metrics["f1_score"]), label="F1 Score", marker="o")
+    plt.plot(folds, np.array(fold_metrics["auc_roc"]), label="AUC-ROC", marker="o")
+    plt.xlabel("Fold")
+    plt.ylabel("Metrics")
+    plt.title("Validation Metrics Across Folds (Enhanced Hybrid Model)")
+    plt.xticks(folds)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('metrics_plot.png')
+
+    # Plot loss curves across folds
+    plt.figure(figsize=(12, 6))
+    for idx in range(k_folds):
+        epochs_filled = range(1, len(fold_train_losses[idx]) + 1)
+        plt.plot(epochs_filled, fold_train_losses[idx], label=f"Fold {idx+1} Train Loss")
+        plt.plot(epochs_filled, fold_val_losses[idx], label=f"Fold {idx+1} Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training and Validation Loss Across Folds (Enhanced Hybrid Model)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot.png')
+
+    avg_acc = np.mean(fold_metrics["accuracy"])
+    avg_f1 = np.mean(fold_metrics["f1_score"])
+    avg_auc = np.mean(fold_metrics["auc_roc"])
+    print("\nFinal Cross-Validated Metrics (Enhanced Hybrid Model):")
+    print(f"Average Accuracy (with threshold tuning): {avg_acc * 100:.2f}%")
+    print(f"Average F1 Score  (with threshold tuning): {avg_f1:.4f}")
+    print(f"Average AUC-ROC: {avg_auc:.4f}")
+    print("Cross-validation complete!")
+
+#------------------------------------------------------------------------------#
+#                                    MAIN                                      #
+#------------------------------------------------------------------------------#
+if __name__ == "__main__":
+    # Since we already have a pretrained UCLA checkpoint, skip re-pretraining.
+    train_on_cobre()
+    
